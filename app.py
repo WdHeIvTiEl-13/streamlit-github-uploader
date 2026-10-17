@@ -1,242 +1,376 @@
 import base64
-import os
+import hmac
+import io
+import re
 import secrets
-from urllib.parse import urlencode
+import zipfile
+from urllib.parse import quote, urlencode
 
 import requests
 import streamlit as st
+from streamlit_cookies_controller import CookieController
 
-GITHUB_API = "https://api.github.com"
-GITHUB_AUTH = "https://github.com/login/oauth/authorize"
-GITHUB_TOKEN = "https://github.com/login/oauth/access_token"
 
-st.set_page_config(page_title="GitHub Folder Uploader", page_icon="📦", layout="centered")
+# ---------- App settings ----------
+
+st.set_page_config(
+    page_title="GitHub Folder Uploader",
+    page_icon="📦",
+    layout="centered",
+)
+
+APP_URL = "https://9l72f7zvvhtrplk3jjdkh3.streamlit.app"
+GITHUB_AUTH_URL = "https://github.com/login/oauth/authorize"
+GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
+GITHUB_API_URL = "https://api.github.com"
+
+MAX_FILES = 2000
+MAX_TOTAL_SIZE = 100 * 1024 * 1024
+MAX_FILE_SIZE = 25 * 1024 * 1024
+MAX_ZIP_SIZE = 100 * 1024 * 1024
+
 st.title("📦 GitHub Folder Uploader")
-st.caption("Upload a ZIP folder and publish its files to a new or existing GitHub repository.")
+st.write(
+    "Upload a ZIP project. Its folders and files will be "
+    "created individually in your GitHub repository."
+)
 
-def secret(name, default=""):
-    try:
-        return st.secrets.get(name, default)
-    except Exception:
-        return os.getenv(name, default)
+# Secrets must be configured in Streamlit Cloud.
+try:
+    CLIENT_ID = st.secrets["GITHUB_CLIENT_ID"]
+    CLIENT_SECRET = st.secrets["GITHUB_CLIENT_SECRET"]
+except Exception:
+    CLIENT_ID = ""
+    CLIENT_SECRET = ""
 
-CLIENT_ID = secret("GITHUB_CLIENT_ID")
-CLIENT_SECRET = secret("GITHUB_CLIENT_SECRET")
-APP_URL = secret("APP_URL", "").rstrip("/")
+cookies = CookieController()
 
-def api_headers(token):
+
+# ---------- GitHub helpers ----------
+
+def github_headers(token):
     return {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
-def api_request(method, path, token, **kwargs):
-    response = requests.request(
-        method, f"{GITHUB_API}{path}", headers=api_headers(token),
-        timeout=30, **kwargs
+
+def safe_repo_name(value):
+    value = value.strip()
+    parts = value.split("/")
+    return (
+        len(parts) == 2
+        and all(re.fullmatch(r"[A-Za-z0-9_.-]+", p) for p in parts)
+        and parts[0] not in ("", ".", "..")
+        and parts[1] not in ("", ".", "..")
     )
-    if not response.ok:
+
+
+def safe_zip_path(name):
+    name = name.replace("\\", "/")
+
+    if name.startswith("/") or "\x00" in name:
+        return None
+
+    parts = name.split("/")
+
+    if any(p in ("", ".", "..") for p in parts):
+        return None
+
+    # Do not upload Git's internal repository metadata.
+    if ".git" in parts:
+        return None
+
+    # Skip common macOS ZIP metadata.
+    if "__MACOSX" in parts or parts[-1] == ".DS_Store":
+        return None
+
+    return "/".join(parts)
+
+
+def github_contents_url(repo, path):
+    owner, repository = repo.split("/", 1)
+    encoded_path = quote(path, safe="/")
+    return (
+        f"{GITHUB_API_URL}/repos/{owner}/"
+        f"{repository}/contents/{encoded_path}"
+    )
+
+
+def upload_one_file(token, repo, path, data):
+    headers = github_headers(token)
+    url = github_contents_url(repo, path)
+
+    # If the file already exists, get its SHA so it can be updated.
+    check = requests.get(url, headers=headers, timeout=30)
+
+    payload = {
+        "message": f"Upload {path} using GitHub Folder Uploader",
+        "content": base64.b64encode(data).decode("ascii"),
+    }
+
+    if check.status_code == 200:
+        payload["sha"] = check.json()["sha"]
+    elif check.status_code != 404:
+        message = check.json().get("message", check.text)
+        raise RuntimeError(
+            f"Could not check {path}: HTTP "
+            f"{check.status_code} — {message}"
+        )
+
+    result = requests.put(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=60,
+    )
+
+    if result.status_code not in (200, 201):
         try:
-            message = response.json().get("message", response.text)
-        except Exception:
-            message = response.text
-        raise RuntimeError(f"GitHub API ({response.status_code}): {message}")
-    if response.status_code == 204 or not response.content:
-        return {}
-    return response.json()
+            message = result.json().get("message", result.text)
+        except ValueError:
+            message = result.text
 
-def exchange_code(code):
-    response = requests.post(
-        GITHUB_TOKEN,
-        headers={"Accept": "application/json"},
-        data={"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "code": code},
-        timeout=30,
-    )
-    response.raise_for_status()
-    data = response.json()
-    if "access_token" not in data:
-        raise RuntimeError(data.get("error_description", data.get("error", "OAuth login failed")))
-    return data["access_token"]
+        raise RuntimeError(
+            f"{path}: HTTP {result.status_code} — {message}"
+        )
 
-def clean_zip(upload):
-    import io, zipfile
-    result = []
-    total = 0
-    max_files = 1000
-    max_total = 50 * 1024 * 1024
-    with zipfile.ZipFile(io.BytesIO(upload.getvalue())) as zf:
-        entries = [x for x in zf.infolist() if not x.is_dir()]
-        if len(entries) > max_files:
-            raise ValueError(f"ZIP-e beshi file ache. Maximum {max_files} files.")
-        for item in entries:
-            name = item.filename.replace("\\", "/")
-            parts = [p for p in name.split("/") if p not in ("", ".")]
-            if not parts or any(p == ".." for p in parts) or name.startswith("/"):
-                continue
-            if item.flag_bits & 0x1:
-                raise ValueError("Password-protected ZIP support kore na.")
-            content = zf.read(item)
-            total += len(content)
-            if total > max_total:
-                raise ValueError("Uncompressed total size 50 MB-er beshi. Choto ZIP upload korun.")
-            result.append(( "/".join(parts), content))
-    if not result:
-        raise ValueError("ZIP-er moddhe kono valid file paoa jayni.")
-    return result
 
-def create_repo(token, name, private, description):
-    return api_request(
-        "POST", "/user/repos", token,
-        json={"name": name, "private": private, "description": description, "auto_init": True},
-    )
+def upload_zip(token, repo, uploaded_file):
+    zip_bytes = uploaded_file.getvalue()
 
-def upload_commit(token, owner, repo, branch, files, message):
-    # Get the target branch and its base tree. If branch does not exist, start from default branch.
-    repo_info = api_request("GET", f"/repos/{owner}/{repo}", token)
-    default_branch = repo_info.get("default_branch") or "main"
+    if len(zip_bytes) > MAX_ZIP_SIZE:
+        st.error("ZIP file is too large. Maximum size is 100 MB.")
+        return
+
     try:
-        ref = api_request("GET", f"/repos/{owner}/{repo}/git/ref/heads/{branch}", token)
-        parent_sha = ref["object"]["sha"]
-        commit = api_request("GET", f"/repos/{owner}/{repo}/git/commits/{parent_sha}", token)
-        base_tree = commit["tree"]["sha"]
-        parent_commits = [parent_sha]
-        create_branch_ref = False
-    except RuntimeError as e:
-        # If target branch is absent, use default branch as parent and create the requested ref afterward.
-        if "404" not in str(e):
-            raise
-        default_ref = api_request("GET", f"/repos/{owner}/{repo}/git/ref/heads/{default_branch}", token)
-        parent_sha = default_ref["object"]["sha"]
-        default_commit = api_request("GET", f"/repos/{owner}/{repo}/git/commits/{parent_sha}", token)
-        base_tree = default_commit["tree"]["sha"]
-        parent_commits = [parent_sha]
-        create_branch_ref = True
+        archive = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    except (zipfile.BadZipFile, OSError):
+        st.error("The selected file is not a valid ZIP.")
+        return
 
-    tree_items = []
-    for path, content in files:
-        blob = api_request(
-            "POST", f"/repos/{owner}/{repo}/git/blobs", token,
-            json={"content": base64.b64encode(content).decode("ascii"), "encoding": "base64"},
+    with archive:
+        entries = []
+        total_size = 0
+
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+
+            path = safe_zip_path(info.filename)
+
+            if path is None:
+                st.error(
+                    "ZIP contains an unsafe path or unsupported "
+                    f"metadata entry: {info.filename}"
+                )
+                return
+
+            # Reject symbolic links.
+            unix_mode = (info.external_attr >> 16) & 0xFFFF
+            if (unix_mode & 0o170000) == 0o120000:
+                st.error(f"Symbolic links are not supported: {path}")
+                return
+
+            if info.file_size > MAX_FILE_SIZE:
+                st.error(
+                    f"{path} is larger than the 25 MB per-file limit."
+                )
+                return
+
+            total_size += info.file_size
+            entries.append((info, path))
+
+        if not entries:
+            st.error("No project files were found in the ZIP.")
+            return
+
+        if len(entries) > MAX_FILES:
+            st.error(f"Too many files. Limit: {MAX_FILES}.")
+            return
+
+        if total_size > MAX_TOTAL_SIZE:
+            st.error("The uncompressed project exceeds 100 MB.")
+            return
+
+        progress = st.progress(0)
+        status = st.empty()
+        uploaded_count = 0
+
+        for index, (info, path) in enumerate(entries):
+            status.write(f"Uploading {index + 1}/{len(entries)}: `{path}`")
+
+            try:
+                data = archive.read(info)
+                upload_one_file(token, repo, path, data)
+            except Exception as exc:
+                st.error(f"Upload stopped: {exc}")
+                st.info(
+                    "Some earlier files may already have been uploaded. "
+                    "Fix the error and try again."
+                )
+                return
+
+            uploaded_count += 1
+            progress.progress(uploaded_count / len(entries))
+
+        status.success(
+            f"Finished! {uploaded_count} files uploaded to GitHub."
         )
-        tree_items.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
-
-    new_tree = api_request(
-        "POST", f"/repos/{owner}/{repo}/git/trees", token,
-        json={"base_tree": base_tree, "tree": tree_items},
-    )
-    new_commit = api_request(
-        "POST", f"/repos/{owner}/{repo}/git/commits", token,
-        json={"message": message or "Upload files with Streamlit GitHub Uploader",
-              "tree": new_tree["sha"], "parents": parent_commits},
-    )
-
-    if create_branch_ref:
-        api_request(
-            "POST", f"/repos/{owner}/{repo}/git/refs", token,
-            json={"ref": f"refs/heads/{branch}", "sha": new_commit["sha"]},
+        st.link_button(
+            "Open GitHub repository",
+            f"https://github.com/{repo}",
         )
-    else:
-        api_request(
-            "PATCH", f"/repos/{owner}/{repo}/git/refs/heads/{branch}", token,
-            json={"sha": new_commit["sha"], "force": False},
-        )
-    return new_commit["sha"]
 
-# OAuth callback processing
+
+# ---------- OAuth callback ----------
+
 params = st.query_params
+auth_code = params.get("code")
+returned_state = params.get("state")
+
 if params.get("error"):
-    st.error("GitHub login cancel/failed hoyeche: " + str(params.get("error_description", params.get("error"))))
+    st.error(
+        "GitHub login was cancelled or denied. "
+        "Please try again."
+    )
     st.query_params.clear()
-if params.get("code"):
-    expected = st.session_state.get("oauth_state")
-    returned = params.get("state")
-    if not expected or not returned or not secrets.compare_digest(str(expected), str(returned)):
-        st.error("OAuth state mismatch. Security-r jonno abar login korun.")
-        st.query_params.clear()
-    elif not CLIENT_ID or not CLIENT_SECRET:
-        st.error("GitHub OAuth secrets configure kora nei.")
-    else:
-        try:
-            st.session_state["github_token"] = exchange_code(str(params.get("code")))
-            st.session_state.pop("oauth_state", None)
+    st.stop()
+
+if auth_code:
+    saved_state = cookies.get("oauth_state")
+
+    if (
+        not saved_state
+        or not returned_state
+        or not hmac.compare_digest(
+            str(saved_state), str(returned_state)
+        )
+    ):
+        st.error(
+            "OAuth state mismatch. The browser did not return "
+            "the expected login cookie. Start login again in the "
+            "same browser, with cookies enabled."
+        )
+        if st.button("Clear login attempt"):
+            cookies.remove("oauth_state")
+            st.session_state.pop("pending_oauth_state", None)
             st.query_params.clear()
             st.rerun()
-        except Exception as e:
-            st.error(f"Login error: {e}")
-            st.query_params.clear()
+        st.stop()
 
-if not CLIENT_ID or not CLIENT_SECRET:
-    st.warning("Age GitHub OAuth app setup korun. README-te step-by-step instruction ache.")
-    st.stop()
+    # State matched; remove the one-time cookie.
+    cookies.remove("oauth_state")
+    st.session_state.pop("pending_oauth_state", None)
 
-if "github_token" not in st.session_state:
-    st.write("GitHub account connect kore ZIP-er files upload korun.")
-    if st.button("Continue with GitHub", type="primary", use_container_width=True):
-        state = secrets.token_urlsafe(24)
-        st.session_state["oauth_state"] = state
-        callback = APP_URL or st.context.url.split("?")[0]
-        query = urlencode({"client_id": CLIENT_ID, "redirect_uri": callback,
-                           "scope": "repo", "state": state})
-        st.link_button("Open GitHub authorization", f"{GITHUB_AUTH}?{query}", use_container_width=True)
-    st.caption("Login button click korar por GitHub authorization page-e approve korte hobe.")
-    st.stop()
+    if not CLIENT_ID or not CLIENT_SECRET:
+        st.error("GitHub OAuth credentials are missing in Streamlit Secrets.")
+        st.stop()
 
-token = st.session_state["github_token"]
-try:
-    user = api_request("GET", "/user", token)
-    st.success(f"Connected as **@{user.get('login', 'GitHub user')}**")
-except Exception:
-    st.session_state.pop("github_token", None)
-    st.error("GitHub session invalid hoyeche. Page refresh kore abar login korun.")
-    st.stop()
-
-with st.form("upload_form"):
-    mode = st.radio("Repository", ["Create new repository", "Use existing repository"])
-    if mode == "Create new repository":
-        repo_name = st.text_input("New repository name", placeholder="my-project")
-        private = st.checkbox("Private repository", value=True)
-        description = st.text_input("Description (optional)")
-        owner = user.get("login", "")
-    else:
-        repo_full = st.text_input("Existing repository", placeholder="username/repository")
-        owner = ""
-        repo_name = ""
-        private = True
-        description = ""
-    branch = st.text_input("Branch name", value="main")
-    commit_message = st.text_input("Commit message", value="Upload project files")
-    zip_file = st.file_uploader("Project folder as ZIP", type=["zip"])
-    submitted = st.form_submit_button("Upload and push to GitHub", type="primary", use_container_width=True)
-
-if submitted:
     try:
-        if not zip_file:
-            raise ValueError("Age project folder-er ZIP file select korun.")
-        if mode == "Create new repository":
-            if not repo_name.strip():
-                raise ValueError("Repository name din.")
-            repo_info = create_repo(token, repo_name.strip(), private, description.strip())
-            owner, repo_name = repo_info["owner"]["login"], repo_info["name"]
-        else:
-            bits = [x.strip() for x in repo_full.split("/")]
-            if len(bits) != 2 or not all(bits):
-                raise ValueError("Repository format hobe username/repository.")
-            owner, repo_name = bits
-        if not branch.strip() or any(c in branch for c in " ~^:?*[\\"):
-            raise ValueError("Valid branch name din.")
-        files = clean_zip(zip_file)
-        with st.spinner(f"{len(files)} ta file GitHub-e upload hocche..."):
-            sha = upload_commit(token, owner, repo_name, branch.strip(), files, commit_message.strip())
-        st.success(f"Upload complete! {len(files)} ta file commit hoyeche.")
-        st.markdown(f"[Open repository](https://github.com/{owner}/{repo_name})")
-        st.code(sha)
-    except Exception as e:
-        st.error(str(e))
+        response = requests.post(
+            GITHUB_TOKEN_URL,
+            headers={"Accept": "application/json"},
+            data={
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "code": auth_code,
+                "redirect_uri": APP_URL,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        token_data = response.json()
+    except Exception:
+        st.error("Could not exchange the GitHub authorization code.")
+        st.stop()
 
-st.divider()
-if st.button("Disconnect GitHub", use_container_width=True):
-    st.session_state.pop("github_token", None)
-    st.session_state.pop("oauth_state", None)
+    access_token = token_data.get("access_token")
+
+    if not access_token:
+        st.error("GitHub did not return an access token.")
+        st.stop()
+
+    st.session_state["github_token"] = access_token
+    st.query_params.clear()
     st.rerun()
-st.caption("Security: access token sudhu current Streamlit session-e rakha hoy; app code/log-e token print kora hoy na.")
+
+
+# ---------- Login screen ----------
+
+token = st.session_state.get("github_token")
+
+if not token:
+    st.subheader("1. Sign in with GitHub")
+
+    if not CLIENT_ID or not CLIENT_SECRET:
+        st.error(
+            "Set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET "
+            "in Streamlit Cloud → App settings → Secrets."
+        )
+        st.stop()
+
+    if st.button("Prepare GitHub login", type="primary"):
+        state = secrets.token_urlsafe(32)
+        cookies.set("oauth_state", state)
+        st.session_state["pending_oauth_state"] = state
+        st.rerun()
+
+    pending_state = st.session_state.get("pending_oauth_state")
+    cookie_state = cookies.get("oauth_state")
+
+    if pending_state and cookie_state == pending_state:
+        auth_query = urlencode({
+            "client_id": CLIENT_ID,
+            "redirect_uri": APP_URL,
+            "scope": "repo",
+            "state": pending_state,
+        })
+
+        st.link_button(
+            "Continue with GitHub",
+            f"{GITHUB_AUTH_URL}?{auth_query}",
+            type="primary",
+        )
+    elif pending_state:
+        st.warning(
+            "The browser cookie is not ready yet. "
+            "Tap Check cookie, then continue."
+        )
+        if st.button("Check cookie"):
+            st.rerun()
+
+    st.stop()
+
+
+# ---------- Upload screen ----------
+
+st.success("GitHub login successful!")
+st.subheader("2. Upload your project ZIP")
+
+repo = st.text_input(
+    "Target repository (owner/repository)",
+    placeholder="yourusername/your-repository",
+)
+
+uploaded_zip = st.file_uploader(
+    "Choose your project ZIP",
+    type=["zip"],
+    help="Files and nested folders will be uploaded separately.",
+)
+
+if st.button("Upload folders and files", type="primary"):
+    if not safe_repo_name(repo):
+        st.error("Enter the repository as owner/repository.")
+    elif uploaded_zip is None:
+        st.error("Choose a ZIP file first.")
+    else:
+        upload_zip(token, repo, uploaded_zip)
+
+
+if st.button("Logout"):
+    st.session_state.pop("github_token", None)
+    st.session_state.pop("pending_oauth_state", None)
+    cookies.remove("oauth_state")
+    st.rerun()
