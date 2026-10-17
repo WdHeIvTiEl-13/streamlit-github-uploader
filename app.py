@@ -312,9 +312,9 @@ if not token:
         st.stop()
 
     if st.button("Prepare GitHub login", type="primary"):
-    state = secrets.token_urlsafe(32)
-    cookies.set("oauth_state", state)
-    st.session_state["pending_oauth_state"] = state
+        state = secrets.token_urlsafe(32)
+        cookies.set("oauth_state", state)
+        st.session_state["pending_oauth_state"] = state
 
     pending_state = st.session_state.get("pending_oauth_state")
     cookie_state = cookies.get("oauth_state")
